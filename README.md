@@ -9,7 +9,8 @@ una interfaz gráfica: el programa avanza automáticamente en pasos de un segund
 Modelos_simulacion/
 ├── agentes/
 │   ├── cliente.py       # Objeto Cliente
-│   └── ayudante.py      # Objeto Ayudante
+│   ├── ayudante.py      # Objeto Ayudante
+│   └── markov.py        # Validación y sorteo de cadenas de Markov
 ├── simulacion/
 │   └── restaurante.py   # Control y métricas de la simulación
 ├── tests/
@@ -20,7 +21,8 @@ Modelos_simulacion/
 ## Agentes
 
 - `Cliente`: espera su pedido, recibe la comida, busca una mesa, come y sale.
-  Puede abandonar si espera demasiado.
+  Puede abandonar si espera demasiado. Al terminar de comer decide con una
+  cadena de Markov si vuelve a hacer fila o se va (ver más abajo).
 - `Ayudante`: busca platos sucios, los recoge, lleva al lavaplatos, lava, seca y
   guarda. Tiene un sistema dinámico de energía (barra mostrada por consola):
   cada etapa completada del ciclo le consume energía y, al llegar a 0, entra
@@ -42,6 +44,38 @@ Modelos_simulacion/
   agotarse y se recupere en pocos segundos, sin detener la simulación por
   periodos prolongados.
 
+## Cadenas de Markov
+
+Los estados de ambos agentes se modelan como cadena de Markov lineal (no se
+salta ninguna etapa), guardada como diccionario de listas
+`estado -> [(destino, probabilidad), ...]`. Las probabilidades que salen de
+un mismo estado suman 1; `validar_transiciones` lo comprueba al importar los
+módulos y `siguiente_estado` sortea con el generador de la simulación
+(`self.aleatorio`), por lo que la semilla sigue dando corridas idénticas.
+
+**Cliente** (`TRANSICIONES_CLIENTE`): solo hay decisión al terminar de comer.
+
+| Estado | Destinos (probabilidad) |
+|---|---|
+| `SALIENDO` | `HACER_FILA` 0.3, `FIN` 0.7 |
+| Demás estados | una sola salida, 1.0 |
+
+Si vuelve a la fila se cuenta como una **visita nueva**: se reinician llegada,
+paciencia y tiempos, y se sortea una receta nueva (Lq y Wq se miden por
+visita). `ABANDONO` no está en la cadena: lo causa la paciencia agotada.
+
+**Ayudante** (`TRANSICIONES_AYUDANTE`):
+
+| Estado | Destinos (probabilidad) |
+|---|---|
+| `LAVANDO` | `SECANDO` 0.9, `LAVANDO` 0.1 (repite) |
+| `SECANDO` | `GUARDANDO` 0.9, `SECANDO` 0.1 (repite) |
+| `GUARDANDO` | `DESOCUPADO` 0.5, `BUSCANDO_PLATOS` 0.5 |
+| Demás estados | una sola salida, 1.0 |
+
+`DESCANSANDO` queda fuera de la cadena porque lo gobierna la energía. Repetir
+una etapa vuelve a durar lo mismo y a gastar su energía.
+
 La cocina se representa como un servidor FIFO. También existen tres recursos
 limitados: mesas, platos limpios y capacidad de la cola.
 
@@ -59,6 +93,10 @@ La simulación muestra los eventos y al final presenta las siguientes métricas:
 - Tiempo promedio dentro del sistema.
 - Tasa de salida y probabilidad de abandono.
 - Promedio de platos sucios pendientes.
+- Reingresos a la fila (clientes que deciden pedir otra vez).
+
+La barra de energía del ayudante se imprime solo cuando cambia su estado y en
+el resumen de cada minuto.
 
 ## Cambiar el escenario
 

@@ -1,3 +1,39 @@
+import random
+
+from .markov import siguiente_estado, validar_transiciones
+
+
+# Cadena de Markov del ciclo de trabajo. Es lineal (no se salta ninguna
+# etapa): las únicas decisiones con azar son repetir una etapa o, tras
+# guardar, decidir si seguir con otro ciclo.
+TRANSICIONES_AYUDANTE = {
+    "DESOCUPADO": [("BUSCANDO_PLATOS", 1.0)],
+    "BUSCANDO_PLATOS": [("RECOGIENDO_PLATOS", 1.0)],
+    "RECOGIENDO_PLATOS": [("LLEVANDO_AL_LAVAPLATOS", 1.0)],
+    "LLEVANDO_AL_LAVAPLATOS": [("LAVANDO", 1.0)],
+    "LAVANDO": [("SECANDO", 0.9), ("LAVANDO", 0.1)],  # 10%: quedó sucio
+    "SECANDO": [("GUARDANDO", 0.9), ("SECANDO", 0.1)],  # 10%: sigue húmedo
+    "GUARDANDO": [("DESOCUPADO", 0.5), ("BUSCANDO_PLATOS", 0.5)],
+}
+# DESCANSANDO no está en la cadena a propósito: entrar y salir de ese estado
+# lo decide la energía (determinista), no el azar. Mezclarlo con las
+# probabilidades ocultaría el efecto del sistema de energía.
+validar_transiciones(TRANSICIONES_AYUDANTE)
+
+# Duración (en segundos) de cada estado, en función de los platos cargados.
+# Vive aparte de la cadena porque la cadena solo dice A DÓNDE ir, no cuánto
+# dura; así una etapa repetida vuelve a durar lo mismo que la primera vez.
+DURACIONES_AYUDANTE = {
+    "DESOCUPADO": lambda carga: 0,
+    "BUSCANDO_PLATOS": lambda carga: 2,
+    "RECOGIENDO_PLATOS": lambda carga: 1,
+    "LLEVANDO_AL_LAVAPLATOS": lambda carga: 2,
+    "LAVANDO": lambda carga: 3 * carga,
+    "SECANDO": lambda carga: 2 * carga,
+    "GUARDANDO": lambda carga: 1,
+}
+
+
 class Ayudante:
     """Agente que recoge, lava, seca y guarda los platos.
 
@@ -30,7 +66,12 @@ class Ayudante:
         "GUARDANDO": 3,
     }
 
-    def __init__(self, capacidad=3):
+    def __init__(self, capacidad=3, rng=None):
+        # La simulación pasa su propio generador (self.aleatorio) para que
+        # las decisiones de la cadena dependan de la semilla global.
+        self.rng = rng if rng is not None else random.Random()
+        # Callback que la simulación conecta para registrar cada sorteo.
+        self.registro_markov = None
         self.estado = "DESOCUPADO"
         self.capacidad = capacidad
         self.carga = 0
@@ -74,8 +115,12 @@ class Ayudante:
             return recogidos, limpios, mensaje
 
         if self.estado == "DESOCUPADO":
+            # Arrancar depende de que haya platos sucios (recurso), no del
+            # azar; por eso esta salida se decide aquí y no se sortea.
             if platos_sucios > 0:
-                self.cambiar_estado("BUSCANDO_PLATOS", 2)
+                self.cambiar_estado(
+                    "BUSCANDO_PLATOS", DURACIONES_AYUDANTE["BUSCANDO_PLATOS"](0)
+                )
                 mensaje = "El ayudante comenzó a buscar platos sucios"
             return recogidos, limpios, mensaje
 
@@ -94,34 +139,41 @@ class Ayudante:
 
         estado_completado = self.estado
 
-        if self.estado == "BUSCANDO_PLATOS":
-            self.cambiar_estado("RECOGIENDO_PLATOS", 1)
-
-        elif self.estado == "RECOGIENDO_PLATOS":
+        # Efectos sobre los platos: dependen de los recursos, no del azar,
+        # así que se aplican antes de sortear el siguiente estado.
+        sin_platos = False
+        if estado_completado == "RECOGIENDO_PLATOS":
             self.carga = min(self.capacidad, platos_sucios)
             recogidos = self.carga
             if self.carga == 0:
-                self.cambiar_estado("DESOCUPADO", 0)
+                # No había nada que recoger: se vuelve a DESOCUPADO sin
+                # sortear (la cadena solo modela el ciclo con platos).
+                sin_platos = True
             else:
-                self.cambiar_estado("LLEVANDO_AL_LAVAPLATOS", 2)
                 mensaje = f"El ayudante recogió {self.carga} plato(s)"
 
-        elif self.estado == "LLEVANDO_AL_LAVAPLATOS":
-            self.cambiar_estado("LAVANDO", 3 * self.carga)
-
-        elif self.estado == "LAVANDO":
-            self.cambiar_estado("SECANDO", 2 * self.carga)
-
-        elif self.estado == "SECANDO":
-            self.cambiar_estado("GUARDANDO", 1)
-
-        elif self.estado == "GUARDANDO":
+        elif estado_completado == "GUARDANDO":
             limpios = self.carga
             self.platos_lavados += self.carga
             mensaje = f"El ayudante guardó {self.carga} plato(s) limpio(s)"
             self.carga = 0
-            self.cambiar_estado("DESOCUPADO", 0)
 
+        if sin_platos:
+            siguiente = "DESOCUPADO"
+        else:
+            siguiente = siguiente_estado(
+                TRANSICIONES_AYUDANTE,
+                estado_completado,
+                self.rng,
+                self.registro_markov,
+            )
+        self.cambiar_estado(siguiente, DURACIONES_AYUDANTE[siguiente](self.carga))
+
+        if siguiente == estado_completado:
+            mensaje = f"El ayudante repite la etapa {estado_completado}"
+
+        # Se gasta energía por la etapa que se acaba de completar, también
+        # cuando se repite: repetir es volver a hacer el esfuerzo completo.
         self.gastar_energia(estado_completado)
 
         return recogidos, limpios, mensaje
