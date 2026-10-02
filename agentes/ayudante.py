@@ -1,6 +1,7 @@
 import random
 
 from .markov import siguiente_estado, validar_transiciones
+from .hmm import estado_inicial, siguiente_estado_oculto, emitir_observacion, validar_pi
 
 
 # Cadena de Markov del ciclo de trabajo. Es lineal (no se salta ninguna
@@ -32,6 +33,36 @@ DURACIONES_AYUDANTE = {
     "SECANDO": lambda carga: 2 * carga,
     "GUARDANDO": lambda carga: 1,
 }
+
+# Modelo Oculto de Markov del "rendimiento real" del ayudante. Es una cadena
+# PARALELA e independiente de self.estado (el ciclo visible) y de
+# self.energia (el sistema determinista de abajo): no deriva de ninguno de
+# los dos, es su propio proceso estocástico oculto que nunca se consulta
+# directamente, solo se manifiesta a través de cuánto tarda cada etapa.
+TRANSICION_OCULTA_RENDIMIENTO = {
+    "RENDIMIENTO_ALTO": [("RENDIMIENTO_ALTO", 0.8), ("RENDIMIENTO_BAJO", 0.2)],
+    "RENDIMIENTO_BAJO": [("RENDIMIENTO_ALTO", 0.3),("RENDIMIENTO_BAJO", 0.5),("FATIGADO", 0.2),],
+    "FATIGADO": [("RENDIMIENTO_BAJO", 0.6), ("FATIGADO", 0.4)],
+}
+validar_transiciones(TRANSICION_OCULTA_RENDIMIENTO)
+
+# Matriz de emisión: qué tan rápida se observa cada etapa según el
+# rendimiento oculto real. RAPIDA/NORMAL/LENTA son categorías de la
+# duración, no estados de la cadena, por eso van como `terminales`.
+EMISION_RENDIMIENTO = {
+    "RENDIMIENTO_ALTO": [("RAPIDA", 0.6), ("NORMAL", 0.3), ("LENTA", 0.1)],
+    "RENDIMIENTO_BAJO": [("RAPIDA", 0.2), ("NORMAL", 0.5), ("LENTA", 0.3)],
+    "FATIGADO": [("RAPIDA", 0.05), ("NORMAL", 0.25), ("LENTA", 0.7)],
+}
+validar_transiciones(EMISION_RENDIMIENTO, terminales=("RAPIDA", "NORMAL", "LENTA"))
+
+PI_RENDIMIENTO = {"RENDIMIENTO_ALTO": 0.6, "RENDIMIENTO_BAJO": 0.3, "FATIGADO": 0.1}
+validar_pi(PI_RENDIMIENTO, TRANSICION_OCULTA_RENDIMIENTO)
+
+# Factor que escala la duración base según la observación emitida. Vive
+# junto a DURACIONES_AYUDANTE por la misma razón que esa tabla está
+# separada de la cadena: la cadena solo dice el estado, no cuánto dura.
+FACTOR_DURACION_POR_OBSERVACION = {"RAPIDA": 0.7, "NORMAL": 1.0, "LENTA": 1.5}
 
 
 class Ayudante:
@@ -83,6 +114,16 @@ class Ayudante:
         self.estado_antes_descanso = None
         self.tiempo_restante_antes_descanso = 0
 
+        # Estado oculto de rendimiento y sus secuencias paralelas: viven en
+        # el agente (no solo en la simulación) porque son estado propio del
+        # ayudante, igual que self.estado o self.energia. La simulación las
+        # lee al final para correr Viterbi y comparar inferido vs. real.
+        self.estado_oculto = estado_inicial(PI_RENDIMIENTO, self.rng)
+        self.historial_estados_ocultos = []
+        self.historial_observaciones = []
+        self.registro_hmm_transicion = None
+        self.registro_hmm_emision = None
+
     def cambiar_estado(self, nuevo_estado, duracion):
         self.estado = nuevo_estado
         self.tiempo_restante = duracion
@@ -93,6 +134,30 @@ class Ayudante:
 
     def recuperar_energia(self):
         self.energia = min(self.ENERGIA_MAXIMA, self.energia + self.TASA_RECUPERACION)
+
+    def avanzar_rendimiento_oculto(self):
+        """Avanza la cadena oculta y emite la observación de duración para
+        la etapa que está por empezar (no la que acaba de terminar): el
+        estado oculto en t determina cuánto durará la etapa de trabajo que
+        arranca en t, y esa duración, una vez transcurrida, ES la
+        observación de esa etapa. Por eso se sortea aquí, antes de fijar
+        la duración real con cambiar_estado().
+        """
+        self.estado_oculto = siguiente_estado_oculto(
+            TRANSICION_OCULTA_RENDIMIENTO,
+            self.estado_oculto,
+            self.rng,
+            self.registro_hmm_transicion,
+        )
+        observacion = emitir_observacion(
+            EMISION_RENDIMIENTO,
+            self.estado_oculto,
+            self.rng,
+            self.registro_hmm_emision,
+        )
+        self.historial_estados_ocultos.append(self.estado_oculto)
+        self.historial_observaciones.append(observacion)
+        return observacion
 
     def barra_energia(self):
         ancho = 20
@@ -160,6 +225,7 @@ class Ayudante:
 
         if sin_platos:
             siguiente = "DESOCUPADO"
+            duracion = DURACIONES_AYUDANTE[siguiente](self.carga)
         else:
             siguiente = siguiente_estado(
                 TRANSICIONES_AYUDANTE,
@@ -167,7 +233,14 @@ class Ayudante:
                 self.rng,
                 self.registro_markov,
             )
-        self.cambiar_estado(siguiente, DURACIONES_AYUDANTE[siguiente](self.carga))
+            duracion_base = DURACIONES_AYUDANTE[siguiente](self.carga)
+            # El rendimiento oculto solo modula trabajo real observable;
+            # DESOCUPADO dura 0 y no cuenta como una etapa que se pueda
+            # medir como rápida o lenta, por eso queda fuera (sin_platos).
+            observacion = self.avanzar_rendimiento_oculto()
+            factor = FACTOR_DURACION_POR_OBSERVACION[observacion]
+            duracion = max(1, round(duracion_base * factor)) if duracion_base else 0
+        self.cambiar_estado(siguiente, duracion)
 
         if siguiente == estado_completado:
             mensaje = f"El ayudante repite la etapa {estado_completado}"

@@ -3,8 +3,23 @@ import os
 import random
 
 from agentes import Ayudante, Cliente
-from agentes.ayudante import TRANSICIONES_AYUDANTE
+from agentes.ayudante import (
+    TRANSICIONES_AYUDANTE,
+    TRANSICION_OCULTA_RENDIMIENTO,
+    EMISION_RENDIMIENTO,
+    PI_RENDIMIENTO,
+)
 from agentes.cliente import TRANSICIONES_CLIENTE
+from agentes.hmm import viterbi
+from agentes.juegos import (
+    PAYOFFS_COCINERO,
+    PROB_ERROR_RAPIDO,
+    FACTOR_RAPIDO,
+    PENALIZACION_ERROR,
+    clasificar_cola,
+    elegir_estrategia,
+    ocurre_error,
+)
 
 
 RECETAS = [
@@ -26,6 +41,8 @@ class SimulacionRestaurante:
         mostrar_eventos=True,
         mostrar_markov=False,
         resumen_markov=False,
+        resumen_hmm=False,
+        resumen_juegos=False,
         carpeta_salida=None,
     ):
         self.duracion = duracion
@@ -35,6 +52,10 @@ class SimulacionRestaurante:
         self.mostrar_markov = mostrar_markov
         # Tablas al inicio y frecuencias observadas al final, en consola.
         self.resumen_markov = resumen_markov
+        # Inferencia Viterbi del rendimiento oculto del ayudante, al final.
+        self.resumen_hmm = resumen_hmm
+        # Decisiones del cocinero y tasa de error, al final.
+        self.resumen_juegos = resumen_juegos
         # Si se da una carpeta, guardar_salida() escribe ahí el detalle.
         self.carpeta_salida = carpeta_salida
         # Bitácora completa: se llena siempre (aunque no se imprima) para
@@ -42,6 +63,10 @@ class SimulacionRestaurante:
         self.bitacora = []
         # Veces que ocurrió cada sorteo: (agente, origen, destino) -> conteo.
         self.conteo_markov = {}
+        # Veces que el cocinero eligió cada estrategia por condición de
+        # cola: (condicion, estrategia) -> conteo.
+        self.conteo_estrategias = {}
+        self.errores_cocina = 0
         self.aleatorio = random.Random(semilla)
 
         # Parámetros que se pueden cambiar para probar otros escenarios.
@@ -62,6 +87,13 @@ class SimulacionRestaurante:
         self.platos_sucios = 0
         self.ayudante = Ayudante(rng=self.aleatorio)
         self.ayudante.registro_markov = self.crear_registro_markov("Ayudante")
+        self.ayudante.registro_hmm_transicion = self.crear_registro_markov(
+            "Ayudante-Rendimiento"
+        )
+        self.ayudante.registro_hmm_emision = self.crear_registro_markov(
+            "Ayudante-Observacion"
+        )
+        self.registro_juegos = self.crear_registro_estrategia()
         self.ultimo_estado_ayudante = self.ayudante.estado
         self.reingresos = 0
 
@@ -98,6 +130,24 @@ class SimulacionRestaurante:
             self.conteo_markov[clave] = self.conteo_markov.get(clave, 0) + 1
             self.escribir_evento(
                 f"[MARKOV] {agente}: {origen} -> {destino} (p={probabilidad})",
+                consola=self.mostrar_markov,
+            )
+
+        return registrar
+
+    def crear_registro_estrategia(self):
+        """Callback que elegir_estrategia() llama en cada decisión del
+        cocinero. Vive aparte de crear_registro_markov porque no es una
+        transición de Markov (no hay "probabilidad de salida", hay un
+        payoff esperado), aunque comparte el mismo espíritu de
+        desacoplar el sorteo/decisión de cómo se registra.
+        """
+
+        def registrar(condicion, estrategia, payoff):
+            clave = (condicion, estrategia)
+            self.conteo_estrategias[clave] = self.conteo_estrategias.get(clave, 0) + 1
+            self.escribir_evento(
+                f"[JUEGO] Cocinero: cola={condicion} -> {estrategia} (payoff={payoff})",
                 consola=self.mostrar_markov,
             )
 
@@ -225,10 +275,37 @@ class SimulacionRestaurante:
             cliente.cambiar_estado("ESPERANDO_COMIDA")
             self.tiempos_espera.append(self.tiempo - cliente.llegada)
             self.cliente_en_cocina = cliente
-            self.tiempo_cocina = cliente.tiempo_preparacion
             self.platos_limpios -= 1
+
+            # El cocinero decide RAPIDO o CUIDADOSO según la presión que
+            # queda en la cola (ya sin este cliente): un juego contra el
+            # sistema, no un sorteo de Markov. La decisión maximiza el
+            # payoff esperado; solo las consecuencias de RAPIDO (el error)
+            # son estocásticas.
+            condicion = clasificar_cola(len(self.cola_pedidos))
+            estrategia = elegir_estrategia(
+                PAYOFFS_COCINERO,
+                condicion,
+                {"RAPIDO": PROB_ERROR_RAPIDO, "CUIDADOSO": 0.0},
+                registro=self.registro_juegos,
+            )
+            if estrategia == "RAPIDO":
+                tiempo = max(1, round(cliente.tiempo_preparacion * FACTOR_RAPIDO))
+                if ocurre_error(PROB_ERROR_RAPIDO, self.aleatorio):
+                    tiempo += PENALIZACION_ERROR
+                    self.platos_sucios += 1
+                    self.errores_cocina += 1
+                    self.escribir_evento(
+                        f"Cocina cometió un error con el pedido del cliente "
+                        f"{cliente.numero} (RAPIDO)"
+                    )
+                self.tiempo_cocina = tiempo
+            else:
+                self.tiempo_cocina = cliente.tiempo_preparacion
+
             self.escribir_evento(
-                f"Cocina comenzó el pedido del cliente {cliente.numero}"
+                f"Cocina comenzó el pedido del cliente {cliente.numero} "
+                f"[{estrategia}, cola={condicion}]"
             )
 
     def enviar_a_mesa(self, cliente):
@@ -369,6 +446,80 @@ class SimulacionRestaurante:
                         f"({fila['veces']} veces)"
                     )
 
+    def inferencia_hmm_ayudante(self):
+        """Corre Viterbi sobre toda la secuencia de observaciones del
+        ayudante y la compara contra los estados ocultos reales que la
+        simulación generó (los conoce porque ella misma los sorteó).
+        Mismo espíritu "teórico/generado vs. observado" que
+        frecuencias_markov(), aplicado a inferencia de estados ocultos.
+        """
+        observaciones = self.ayudante.historial_observaciones
+        reales = self.ayudante.historial_estados_ocultos
+        if not observaciones:
+            return None
+
+        inferida = viterbi(
+            observaciones,
+            TRANSICION_OCULTA_RENDIMIENTO,
+            EMISION_RENDIMIENTO,
+            PI_RENDIMIENTO,
+        )
+        aciertos = sum(1 for r, i in zip(reales, inferida) if r == i)
+        return {
+            "longitud": len(observaciones),
+            "aciertos": aciertos,
+            "precision": round(aciertos / len(observaciones), 4),
+            "secuencia_real": reales,
+            "secuencia_inferida": inferida,
+            "observaciones": observaciones,
+        }
+
+    def mostrar_inferencia_hmm(self):
+        resultado = self.inferencia_hmm_ayudante()
+        print("-" * 58)
+        print("HMM: inferencia Viterbi del rendimiento oculto del ayudante")
+        if resultado is None:
+            print("  (el ayudante no completó ninguna etapa con observación)")
+            return
+        print(f"  Observaciones: {resultado['longitud']}")
+        print(
+            f"  Aciertos: {resultado['aciertos']}/{resultado['longitud']} "
+            f"({resultado['precision'] * 100:.1f}%)"
+        )
+
+    def resumen_estrategias_cocina(self):
+        """Cuántas veces se eligió cada estrategia por condición de cola,
+        y la tasa de error observada sobre los RAPIDO elegidos. Mismo
+        espíritu "teórico vs. observado" que frecuencias_markov() e
+        inferencia_hmm_ayudante(), aplicado a las decisiones del cocinero.
+        """
+        por_condicion = {}
+        for (condicion, estrategia), veces in self.conteo_estrategias.items():
+            por_condicion.setdefault(condicion, {})[estrategia] = veces
+        total_rapido = sum(v.get("RAPIDO", 0) for v in por_condicion.values())
+        return {
+            "decisiones": por_condicion,
+            "errores": self.errores_cocina,
+            "tasa_error_observada": (
+                round(self.errores_cocina / total_rapido, 4) if total_rapido else None
+            ),
+            "prob_error_teorica": PROB_ERROR_RAPIDO,
+        }
+
+    def mostrar_resumen_estrategias_cocina(self):
+        print("-" * 58)
+        print("JUEGOS: estrategia del cocinero por condición de cola")
+        resumen = self.resumen_estrategias_cocina()
+        for condicion, estrategias in resumen["decisiones"].items():
+            detalle = ", ".join(f"{e}={v}" for e, v in estrategias.items())
+            print(f"  {condicion}: {detalle}")
+        obs = resumen["tasa_error_observada"]
+        obs_txt = "sin datos" if obs is None else f"{obs:.2f}"
+        print(
+            f"  Errores en RAPIDO: {resumen['errores']} "
+            f"(teórica {resumen['prob_error_teorica']:.2f} | observada {obs_txt})"
+        )
+
     def guardar_salida(self):
         """Escribe el detalle en `carpeta_salida` (si se configuró).
 
@@ -402,8 +553,35 @@ class SimulacionRestaurante:
         with open(ruta("resultados.json"), "w", encoding="utf-8") as f:
             json.dump(self.calcular_resultados(), f, ensure_ascii=False, indent=2)
 
+        hmm = {
+            "modelo": {
+                "A": {
+                    e: [[d, p] for d, p in s]
+                    for e, s in TRANSICION_OCULTA_RENDIMIENTO.items()
+                },
+                "B": {
+                    e: [[d, p] for d, p in s]
+                    for e, s in EMISION_RENDIMIENTO.items()
+                },
+                "pi": PI_RENDIMIENTO,
+            },
+            "inferencia": self.inferencia_hmm_ayudante(),
+        }
+        with open(ruta("hmm.json"), "w", encoding="utf-8") as f:
+            json.dump(hmm, f, ensure_ascii=False, indent=2)
+
+        juegos = {
+            "payoffs": PAYOFFS_COCINERO,
+            "prob_error_rapido": PROB_ERROR_RAPIDO,
+            "factor_rapido": FACTOR_RAPIDO,
+            "penalizacion_error": PENALIZACION_ERROR,
+            "resumen": self.resumen_estrategias_cocina(),
+        }
+        with open(ruta("juegos.json"), "w", encoding="utf-8") as f:
+            json.dump(juegos, f, ensure_ascii=False, indent=2)
+
         print(f"\nDetalle guardado en: {os.path.abspath(self.carpeta_salida)}")
-        print("  eventos.txt, markov.json, resultados.json")
+        print("  eventos.txt, markov.json, hmm.json, juegos.json, resultados.json")
 
     def promedio(self, datos):
         if not datos:
@@ -464,3 +642,7 @@ class SimulacionRestaurante:
 
         if self.resumen_markov:
             self.mostrar_frecuencias_markov()
+        if self.resumen_hmm:
+            self.mostrar_inferencia_hmm()
+        if self.resumen_juegos:
+            self.mostrar_resumen_estrategias_cocina()

@@ -12,6 +12,8 @@ TIEMPO_SIMULACION = 300  # segundos simulados
 SEMILLA_ALEATORIA = 7
 MOSTRAR_EVENTOS = False  # eventos segundo a segundo en consola
 MOSTRAR_SORTEOS_MARKOV = False  # cada sorteo de Markov en consola
+MOSTRAR_RESUMEN_HMM = True  # inferencia Viterbi del ayudante al final
+MOSTRAR_RESUMEN_JUEGOS = True  # estrategia del cocinero y tasa de error
 CARPETA_SALIDA = "salida"  # el detalle completo se guarda aquí (None = no)
 
 
@@ -26,6 +28,8 @@ def main():
         mostrar_eventos=MOSTRAR_EVENTOS,
         mostrar_markov=MOSTRAR_SORTEOS_MARKOV,
         resumen_markov=True,
+        resumen_hmm=MOSTRAR_RESUMEN_HMM,
+        resumen_juegos=MOSTRAR_RESUMEN_JUEGOS,
         carpeta_salida=CARPETA_SALIDA,
     )
     simulacion.ejecutar()
